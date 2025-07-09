@@ -1,0 +1,172 @@
+import os
+import numpy as np
+import matplotlib
+matplotlib.use('Agg') # non-GUI backend
+import matplotlib.pyplot as plt
+from moku.instruments import Datalogger
+from moku.exceptions import InvalidParameterException
+
+# ---- USER CONFIGURATION ----
+IP       = '192.168.2.52' # Moku IP address
+Tp       = 20e-3          # Chirp Duration (ms)
+fs_req   = 100e3          # Requested sample rate (Hz)
+duration = 1.0            # Capture length (s)
+B        = 50e6           # Chirp sweep bandwidth (Hz)
+c        = 3e8            # Speed of light (m/s)
+
+#Prepare output directory for PNGs
+out_dir = "plots"
+os.makedirs(out_dir, exist_ok=True)
+
+# ---- ACQUIRE FROM MOKU ----
+dl = Datalogger(IP, force_connect=True) #Instantiates the Data Logger
+try:
+    dl.enable_input(1, True) # Sets channel 1 for beat IF
+    dl.enable_input(2, True) # Sets channel 2 for sync pulse
+
+    # Moku Go Data Logger: 1M Ohm, ranges '10Vpp'/'50Vpp'
+    dl.set_frontend(channel=1, impedance='1MOhm', coupling='DC', range='10Vpp') # impedance matches inputs electrical impedance, coupling = 'DC' tells Moku to
+    dl.set_frontend(channel=2, impedance='1MOhm', coupling='DC', range='10Vpp') # pass through the full bandwidth, range = '10Vpp' (+- 5 V)
+
+    # Set or coerce samplerate
+    try:
+        dl.set_samplerate(fs_req)     # Programs the Moku to sample at requested rate: fs_req
+    except InvalidParameterException: # If Moku cannot support rate, raises this exception
+        fs = dl.get_samplerate()
+        print(f"Requested {fs_req} Sa/s was coerced to {fs:.2f} Sa/s") #Lets us know that request was coerced to closest valid rate
+    else:                             # With no exception, device samples at fs_req
+        fs = fs_req
+    print(f"Sampling at {fs:.2f} Sa/s")
+
+    # Stream data
+    dl.start_streaming(duration=duration)       # Tells Moku to begin recording samples continuously for given duration
+    raw = dl.get_stream_data()                  # Blocks until full capture is complete , returns Python dict with arrays 'time', 'ch1', 'ch2'
+    beat = np.array(raw['ch1'])                 # Convert each channel's list into a NumPy array
+    sync = np.array(raw['ch2'])
+finally:
+    dl.stop_streaming()                         # Ensures Moku's data logger stop capturing
+    dl.relinquish_ownership()                   # Release control of instrument
+
+# time vector
+t = np.arange(len(beat)) / fs # np.arange(len(beat)) gives sample indices: 0,1,2,...,N-1.
+                              # Dividing them by fs turns them into seconds. t[i] is time (in s) of i-th sample
+# ---- DEBUG PLOTS ----
+# Beat (first 5 ms)
+plt.figure(figsize=(6, 2))
+plt.plot(t[:int(0.005*fs)], beat[:int(0.005*fs)]) # 0.005*fs computes samples into 5 ms
+plt.title("First 5 ms of Beat Signal")                  # sliced out first 5 ms of data
+plt.xlabel("Time (s)")
+plt.ylabel("Voltage (V)")
+plt.tight_layout()
+path = os.path.join(out_dir, "debug_beat.png")
+plt.savefig(path); print(f"Saved {path}")
+plt.close()
+
+# Sync (first 50 ms)
+plt.figure(figsize=(6, 2))
+plt.plot(t[:int(0.05*fs)], sync[:int(0.05*fs)])   # sliced out first 50 ms of data
+plt.title("First 50 ms of Sync Pulse")
+plt.xlabel("Time (s)")
+plt.ylabel("Voltage (V)")
+plt.tight_layout()
+path = os.path.join(out_dir, "debug_sync.png")
+plt.savefig(path); print(f"Saved {path}")
+plt.close()
+
+# ---- EDGE DETECTION & VALIDATION ----
+thr       = (sync.max() + sync.min()) / 2 # take highest and lowest voltages in sync-pulse trace and average; midpoint becomes threshold
+raw_edges = np.where(np.diff(sync > thr, prepend=False) == 1)[0] # sync > thr: True when sync line above threshold.
+print(f"Detected {len(raw_edges)} rising edges in sync")         # np.where gives sample indices where rising edge occurs. We know exactly at which sample
+                                                                 # each chirp started
+if len(raw_edges) < 1:              # in the case of 0 rising edges; something went wrong
+    raise RuntimeError("No chirp edges detected! Check sync wiring.")
+
+# Full window filtering
+N0          = int(Tp * fs)   # number of samples in one full chirp
+valid_edges = raw_edges[raw_edges + N0 <= len(beat)]    # keeps rising edges for those who have an entire N0 sample window, without running off the end
+print(f"{len(valid_edges)} full-chirp windows available (N0={N0} samples)") # valid_edges are the edge indices used for processing
+
+if len(valid_edges) < 2:
+    raise RuntimeError(
+        f"Not enough full chirps ({len(valid_edges)}) for RTI. "            # RTI with a 2-pulse canceller needs at least 2 chirps. Stops if it doesn't.
+        "Need at least 2. Check your sync pulse rate or capture length."
+    )
+
+# ---- SINGLE-CHIRP FFT CHECK ----
+i0   = valid_edges[0] # sample index of first usable rising edge
+sig0 = beat[i0 : i0 + N0] - np.mean(beat[i0 : i0 + N0]) # beat slices out one chirp's worth of fb and removes any DC residual offset
+win0 = np.hanning(N0)   # applies Hanning window to reduce spectral leakage
+S0   = np.fft.fft(sig0 * win0, n=4 * N0)    # zero-pads the FFT to 4*N0 to interpolate the frequency axis more clearly
+f0   = np.fft.fftfreq(4 * N0, d=1/fs)[:2*N0] # f0 is frequency axis for the positive-frequency half of the spectrum
+mag0 = 20 * np.log10(np.abs(S0)[:2*N0] + 1e-12) # converts the complex FFT output to dB magnitude. 1e-12 prevents log-of-zero
+
+plt.figure(figsize=(6, 3))
+plt.plot(f0, mag0)
+plt.title("FFT of First Valid Chirp")
+plt.xlabel("Beat Frequency (Hz)")
+plt.ylabel("Magnitude (dB)")
+plt.xlim(0, fs/4)       # plots spectrum from 0 to fs/4; should see a rough linear ramp of beat frequencies
+plt.tight_layout()
+path = os.path.join(out_dir, "fft_first_chirp.png")
+plt.savefig(path); print(f"Saved {path}")
+plt.close()
+
+# ---- RTI PROCESSING ----
+profiles   = np.stack([beat[i: i + N0] for i in valid_edges]) # Extracts each chirp. profiles is a 2D array of shape (num_chirps, N0)
+diffs      = profiles[1:] - profiles[:-1] # 2-pulse canceller; subtracts each chirp from the one immediately before it, row wise
+rng_ifft   = np.fft.ifft(diffs, axis=1) # take the inverse FFT along each row, turns each beat-frequency spectrum into a range profile
+rng_mag    = 20 * np.log10(np.abs(rng_ifft) + 1e-12) # computes magnitude in dB of each range profile
+
+time_axis  = valid_edges[1:] / fs # builds time axis fpr each two-pulse-canceller profile
+f_bins     = np.fft.fftfreq(N0, d=1/fs)[:N0//2] # + beat-frequency bins from 0 up to Nyquist (fs/2)
+range_axis = (c * Tp * f_bins) / (2 * B) # RANGE FORMULA
+
+print(f"RTI matrix shape: {rng_mag.shape}")
+print(f"Time span: {time_axis.min():.4f}-{time_axis.max():.4f} s")
+print(f"Range span: {range_axis.min():.1f}-{range_axis.max():.1f} m")
+
+# dynamic display limits
+vmin = np.percentile(rng_mag, 5)
+vmax = np.percentile(rng_mag, 99)
+
+# ---- PLOT & SAVE RTI (FULL RANGE) ----
+plt.figure(figsize=(8, 6))
+plt.imshow(
+    rng_mag[:, :N0//2], # take only first half of each IFFT (positive ranges)
+    aspect='auto',
+    extent=(range_axis[0], range_axis[-1], time_axis[-1], time_axis[0]),
+    vmin=vmin, vmax=vmax,
+    cmap='viridis'
+)
+plt.colorbar(label='Magnitude (dB)')
+plt.xlabel("Range (m)")
+plt.ylabel("Time (s)")
+plt.title("RTI - Full Range")
+plt.tight_layout()
+path = os.path.join(out_dir, "rti_full.png")
+plt.savefig(path); print(f"Saved {path}")
+plt.close()
+
+# ---- PLOT & SAVE RTI (ZOOM 0-20 M) ----
+max_zoom = 20.0 # focus plot on first 20 m of range
+ix_max   = np.searchsorted(range_axis, max_zoom) #
+
+plt.figure(figsize=(8, 6))
+plt.imshow(
+        rng_mag[:, :ix_max], # full RTI matrix of shape (num_chirps-1, N0/2)
+        aspect='auto',
+        extent=(range_axis[0], range_axis[ix_max], time_axis[-1], time_axis[0]),
+        vmin=vmin, vmax=vmax,
+        cmap='viridis'
+)
+plt.colorbar(label='Magnitude (dB)')
+plt.xlabel('Range (m)')
+plt.ylabel('Time (s)')
+plt.title(f'RTI - Zoom 0-{max_zoom:.1f} m')
+plt.tight_layout()
+path = os.path.join(out_dir, "rti_zoom.png")
+plt.savefig(path); print(f"Saved {path}")
+plt.close()
+
+
+
